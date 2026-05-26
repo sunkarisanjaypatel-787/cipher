@@ -1,0 +1,160 @@
+package com.solo.cipher
+
+import android.annotation.SuppressLint
+import android.app.Service
+import android.content.Intent
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Environment
+import android.os.IBinder
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import kotlin.concurrent.thread
+import kotlin.math.sqrt
+
+class AudioService : Service() {
+
+    private val SAMPLE_RATE = 16000
+    private val SILENCE_THRESHOLD = 500
+    private val SILENCE_DURATION_MS = 2000
+    private val AUDIO_FILE_NAME = "cipher_command.wav"
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Run the mic capture on a separate thread to avoid UI lag
+        thread {
+            captureAudioAndTrigger()
+        }
+        return START_NOT_STICKY // Don't restart the service if the OS kills it
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun captureAudioAndTrigger() {
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        val audioRecord: AudioRecord
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBufferSize
+            )
+        } catch (e: SecurityException) {
+            stopSelf()
+            return
+        }
+
+        val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val outputFile = File(downloadDir, AUDIO_FILE_NAME)
+        val outputStream = FileOutputStream(outputFile)
+
+        writeWavHeader(outputStream, 0, 0, SAMPLE_RATE, 1, 16)
+
+        val buffer = ShortArray(minBufferSize)
+        var isRecording = true
+        var silenceStartTime = 0L
+        var totalAudioLen = 0L
+
+        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+            outputStream.close()
+            stopSelf()
+            return
+        }
+
+        audioRecord.startRecording()
+
+        while (isRecording) {
+            val readSize = audioRecord.read(buffer, 0, buffer.size)
+            if (readSize > 0) {
+                val byteBuffer = ByteArray(readSize * 2)
+                for (i in 0 until readSize) {
+                    byteBuffer[i * 2] = (buffer[i].toInt() and 0x00FF).toByte()
+                    byteBuffer[i * 2 + 1] = (buffer[i].toInt() shr 8).toByte()
+                    buffer[i] = 0
+                }
+                outputStream.write(byteBuffer)
+                totalAudioLen += byteBuffer.size
+
+                var sum = 0.0
+                for (i in 0 until readSize) {
+                    val sample = byteBuffer[i * 2].toInt() or (byteBuffer[i * 2 + 1].toInt() shl 8)
+                    sum += sample * sample
+                }
+                val rms = sqrt(sum / readSize)
+
+                if (rms < SILENCE_THRESHOLD) {
+                    if (silenceStartTime == 0L) {
+                        silenceStartTime = System.currentTimeMillis()
+                    } else if (System.currentTimeMillis() - silenceStartTime > SILENCE_DURATION_MS) {
+                        isRecording = false
+                    }
+                } else {
+                    silenceStartTime = 0L
+                }
+            }
+        }
+
+        audioRecord.stop()
+        audioRecord.release()
+        outputStream.close()
+
+        updateWavHeader(outputFile, totalAudioLen)
+
+        // File is written. Hand off to Python.
+        triggerTermux()
+    }
+
+    private fun triggerTermux() {
+        val termuxIntent = Intent()
+        termuxIntent.setClassName("com.termux", "com.termux.app.RunCommandService")
+        termuxIntent.action = "com.termux.RUN_COMMAND"
+
+        termuxIntent.putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/python3")
+        termuxIntent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("/data/data/com.termux/files/home/python/cipher_core.py"))
+        termuxIntent.putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/com.termux/files/home/python")
+        termuxIntent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
+
+        startService(termuxIntent)
+
+        // Mission complete. Kill the service.
+        stopSelf()
+    }
+
+    // [Keep your writeWavHeader and updateWavHeader functions exactly as they were in MainActivity]
+    private fun writeWavHeader(out: FileOutputStream, totalAudioLen: Long, totalDataLen: Long, longSampleRate: Int, channels: Int, byteRate: Int) {
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte(); header[5] = (totalDataLen shr 8 and 0xff).toByte(); header[6] = (totalDataLen shr 16 and 0xff).toByte(); header[7] = (totalDataLen shr 24 and 0xff).toByte()
+        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; header[20] = 1; header[21] = 0; header[22] = channels.toByte(); header[23] = 0
+        header[24] = (longSampleRate and 0xff).toByte(); header[25] = (longSampleRate shr 8 and 0xff).toByte(); header[26] = (longSampleRate shr 16 and 0xff).toByte(); header[27] = (longSampleRate shr 24 and 0xff).toByte()
+        val byteRateCalc = longSampleRate * channels * byteRate / 8
+        header[28] = (byteRateCalc and 0xff).toByte(); header[29] = (byteRateCalc shr 8 and 0xff).toByte(); header[30] = (byteRateCalc shr 16 and 0xff).toByte(); header[31] = (byteRateCalc shr 24 and 0xff).toByte()
+        header[32] = (channels * byteRate / 8).toByte(); header[33] = 0; header[34] = byteRate.toByte(); header[35] = 0
+        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+        header[40] = (totalAudioLen and 0xff).toByte(); header[41] = (totalAudioLen shr 8 and 0xff).toByte(); header[42] = (totalAudioLen shr 16 and 0xff).toByte(); header[43] = (totalAudioLen shr 24 and 0xff).toByte()
+        out.write(header, 0, 44)
+    }
+
+    private fun updateWavHeader(file: File, totalAudioLen: Long) {
+        val totalDataLen = totalAudioLen + 36
+        val randomAccessFile = RandomAccessFile(file, "rw")
+        randomAccessFile.seek(4)
+        randomAccessFile.write((totalDataLen and 0xff).toInt()); randomAccessFile.write((totalDataLen shr 8 and 0xff).toInt())
+        randomAccessFile.write((totalDataLen shr 16 and 0xff).toInt()); randomAccessFile.write((totalDataLen shr 24 and 0xff).toInt())
+        randomAccessFile.seek(40)
+        randomAccessFile.write((totalAudioLen and 0xff).toInt()); randomAccessFile.write((totalAudioLen shr 8 and 0xff).toInt())
+        randomAccessFile.write((totalAudioLen shr 16 and 0xff).toInt()); randomAccessFile.write((totalAudioLen shr 24 and 0xff).toInt())
+        randomAccessFile.close()
+    }
+}
