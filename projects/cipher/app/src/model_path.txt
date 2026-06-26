@@ -1,0 +1,65 @@
+currentpath:/mnt/c/coding/mac/cipher/projects/cipher/app/src
+
+main
+├── AndroidManifest.xml
+├── assets
+│   └── model
+│       ├── README
+│       ├── am
+│       │   └── final.mdl
+│       ├── conf
+│       │   ├── mfcc.conf
+│       │   └── model.conf
+│       ├── graph
+│       │   ├── Gr.fst
+│       │   ├── HCLr.fst
+│       │   ├── disambig_tid.int
+│       │   └── phones
+│       │       └── word_boundary.int
+│       └── ivector
+│           ├── final.dubm
+│           ├── final.ie
+│           ├── final.mat
+│           ├── global_cmvn.stats
+│           ├── online_cmvn.conf
+│           └── splice.conf
+├── java
+│   └── com
+│       └── solo
+│           └── cipher
+│               ├── AudioService.kt.bak
+│               ├── CipherService.kt
+│               └── MainActivaty.kt
+└── res
+    ├── drawable
+    │   ├── ic_launcher_background.xml
+    │   └── ic_launcher_foreground.xml
+    ├── mipmap-anydpi
+    │   ├── ic_launcher.xml
+    │   └── ic_launcher_round.xml
+    ├── mipmap-hdpi
+    │   ├── ic_launcher.webp
+    │   └── ic_launcher_round.webp
+    ├── mipmap-mdpi
+    │   ├── ic_launcher.webp
+    │   └── ic_launcher_round.webp
+    ├── mipmap-xhdpi
+    │   ├── ic_launcher.webp
+    │   └── ic_launcher_round.webp
+    ├── mipmap-xxhdpi
+    │   ├── ic_launcher.webp
+    │   └── ic_launcher_round.webp
+    ├── mipmap-xxxhdpi
+    │   ├── ic_launcher.webp
+    │   └── ic_launcher_round.webp
+    ├── values
+    │   ├── colors.xml
+    │   ├── strings.xml
+    │   └── themes.xml
+    ├── values-night
+    │   └── themes.xml
+    └── xml
+        ├── backup_rules.xml
+        └── data_extraction_rules.xml
+
+23 directories, 38 files

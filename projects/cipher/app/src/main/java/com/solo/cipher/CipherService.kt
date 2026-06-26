@@ -1,142 +1,235 @@
 package com.solo.cipher
 
 import android.annotation.SuppressLint
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.media.SoundPool
 import android.os.Build
-import android.os.Bundle
-import android.service.voice.VoiceInteractionService
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
-import androidx.core.app.NotificationCompat
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import com.k2fsa.sherpa.onnx.*
 import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
+import kotlin.math.min
 
-class CipherService : VoiceInteractionService(), RecognitionListener {
+class CipherService : Service() {
 
-    private val CHANNEL_ID = "CipherServiceChannel"
-    private val SAMPLE_RATE = 16000
-    private var speechService: SpeechService? = null
-    private var model: Model? = null
-    
-    // State control: Is Cipher listening for the wake word, or actively transcribing a command?
+    private val channelId = "CipherCoreChannel"
+    private var isListening = false
     private var isProcessingCommand = false
 
-    override fun onReady() {
-        super.onReady()
-        Log.d("Cipher", "VoiceInteractionService onReady triggered.")
+    // Core Sensory Variables
+    private var audioRecord: AudioRecord? = null
+    private var offlineRecognizer: OfflineRecognizer? = null
+
+    // UX/UI Variables
+    private lateinit var soundPool: SoundPool
+    private var pingSoundId: Int = 0
+    private var abortSoundId: Int = 0
+    private lateinit var windowManager: WindowManager
+    private var blobView: ReactiveBlobView? = null
+
+    override fun onCreate() {
+        super.onCreate()
         createNotificationChannel()
-        startForeground(1, createForegroundNotification())
-        initVosk()
-    }
-
-    private fun initVosk() {
-        Log.d("Cipher", "Initializing Local VOSK Model...")
-        StorageService.unpack(this, "model", "model",
-            { loadedModel ->
-                model = loadedModel
-                startWatchMode()
-            },
-            { e -> Log.e("Cipher", "VOSK Unpack Failed: ${e.message}") }
-        )
-    }
-
-    // STATE 1: Continuous passive listening for "Hey Cipher"
-    private fun startWatchMode() {
-        isProcessingCommand = false
-        try {
-            val recognizer = Recognizer(model, SAMPLE_RATE.toFloat())
-            recognizer.setWords(true)
-            speechService = SpeechService(recognizer, SAMPLE_RATE.toFloat())
-            speechService?.startListening(this)
-            Log.d("Cipher", "Ring 0 (Passive Watch) Active. Awaiting wake word...")
-        } catch (e: Exception) {
-            Log.e("Cipher", "Failed to start passive watch: ${e.message}")
-        }
-    }
-
-    // STATE 2: Triggered. Switch VOSK context to ingest the actual user command
-    private fun igniteCommandCapture() {
-        if (isProcessingCommand) return
-        isProcessingCommand = true
-        
-        Log.d("Cipher", "Cipher awakened. Capture mode engaged. Speak now...")
-        speechService?.stop() // Reset listener for a clean stream capture
-        
-        try {
-            val recognizer = Recognizer(model, SAMPLE_RATE.toFloat())
-            speechService = SpeechService(recognizer, SAMPLE_RATE.toFloat())
-            speechService?.startListening(this)
-        } catch (e: Exception) {
-            Log.e("Cipher", "Failed to ignite command capture: ${e.message}")
-            startWatchMode()
-        }
+        initSherpaOnnx()
+        initAcousticMatrix()
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Handle physical hardware triggers (Long-press power button / overlay)
-        if (intent?.getStringExtra("TRIGGER_TYPE") == "MANUAL") {
-            Log.d("Cipher", "Hardware/Manual Trigger Intercepted.")
-            igniteCommandCapture()
+        if (!isListening && !isProcessingCommand) {
+            startAudioSensor()
         }
         return START_STICKY
     }
 
-    // --- VOSK RECOGNITION DECODER LOOP ---
+    override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onPartialResult(hypothesis: String?) {
-        if (isProcessingCommand) return // Ignore partial matches while processing commands
-        
-        try {
-            val json = JSONObject(hypothesis ?: "{}")
-            val partial = json.optString("partial", "").lowercase()
-            if (partial.contains("cipher")) {
-                igniteCommandCapture()
-            }
-        } catch (e: Exception) {}
+    override fun onDestroy() {
+        super.onDestroy()
+        isListening = false
+        audioRecord?.stop()
+        audioRecord?.release()
+        offlineRecognizer?.release()
+        soundPool.release()
+        removeVisualOverlay()
     }
 
-    override fun onResult(hypothesis: String?) {
-        try {
-            val json = JSONObject(hypothesis ?: "{}")
-            val text = json.optString("text", "").trim()
-            if (text.isEmpty()) return
+    // --- STAGE 1: SYSTEM INITIALIZATION ---
 
-            if (!isProcessingCommand) {
-                // We are in watch mode, verify full word match
-                if (text.contains("cipher")) {
-                    igniteCommandCapture()
-                }
-            } else {
-                // Capture mode active: This text is the actual command payload
-                Log.d("Cipher", "Local STT Complete: \"$text\"")
-                speechService?.stop()
-                
-                // Route text payload to the local Termux neural loop asynchronously
-                thread {
-                    queryLocalNeuralCore(text)
-                }
-            }
+    private fun initSherpaOnnx() {
+        try {
+            val config = OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
+                modelConfig = OfflineModelConfig(
+                    whisper = OfflineWhisperModelConfig(
+                        encoder = "model/tiny.en-encoder.int8.onnx",
+                        decoder = "model/tiny.en-decoder.int8.onnx"
+                    ),
+                    tokens = "model/tiny.en-tokens.txt",
+                    numThreads = 4,
+                    debug = false
+                )
+            )
+            offlineRecognizer = OfflineRecognizer(assetManager = assets, config = config)
         } catch (e: Exception) {
-            Log.e("Cipher", "Result Parsing Error: ${e.message}")
+            Log.e("Cipher", "[-] WHISPER INIT FAILED: ${e.message}")
         }
     }
 
-    // --- LOCAL TERMINAL LINK (TERMUX HTTP COMPONENT) ---
-    private fun queryLocalNeuralCore(commandText: String) {
-        Log.d("Cipher", "Routing payload to local Llama-Server (Port 7000)...")
+    private fun initAcousticMatrix() {
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+
+        soundPool = SoundPool.Builder()
+            .setMaxStreams(2)
+            .setAudioAttributes(audioAttributes)
+            .build()
+
+        // Load zero-latency pings
+        pingSoundId = soundPool.load(this, R.raw.ping, 1)
+        abortSoundId = soundPool.load(this, R.raw.abort, 1)
+    }
+
+    // --- STAGE 2: SENSORY CAPTURE & REACTIVE UI ---
+
+    @SuppressLint("MissingPermission")
+    private fun startAudioSensor() {
+        isListening = true
+        val sampleRate = 16000
+        val bufferSize = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
+        )
+
+        audioRecord?.startRecording()
+
+        // Ignite UX Matrix
+        soundPool.play(pingSoundId, 1f, 1f, 0, 0, 1f)
+        runOnUiThread { showVisualOverlay() }
+
+        thread {
+            val audioData = ShortArray(bufferSize)
+            val floatBuffer = mutableListOf<Float>()
+
+            var silenceFrames = 0
+            var totalFrames = 0
+            val silenceThreshold = 0.025f // Re-calibrated for fast speech
+            val maxSilenceFrames = 14 // ~0.85s silence gate
+            val absoluteMaxFrames = 80 // 5-second hard kill
+
+            while (isListening) {
+                val read = audioRecord?.read(audioData, 0, audioData.size) ?: 0
+                if (read > 0) {
+                    var frameEnergy = 0f
+                    for (i in 0 until read) {
+                        val f = audioData[i].toFloat() / 32768.0f
+                        floatBuffer.add(f)
+                        frameEnergy += f * f
+                    }
+
+                    val rms = Math.sqrt((frameEnergy / read).toDouble()).toFloat()
+                    totalFrames++
+
+                    // Feed RMS to the Visual Overlay
+                    runOnUiThread { blobView?.updateRms(rms) }
+
+                    if (rms < silenceThreshold) {
+                        silenceFrames++
+                    } else {
+                        silenceFrames = 0
+                    }
+
+                    if ((silenceFrames > maxSilenceFrames && floatBuffer.size > 8000) || totalFrames >= absoluteMaxFrames) {
+                        isListening = false
+                    }
+                }
+            }
+
+            audioRecord?.stop()
+            runOnUiThread { removeVisualOverlay() } // Extinguish visual matrix
+
+            // Decode Audio
+            val stream = offlineRecognizer?.createStream() ?: return@thread
+            stream.acceptWaveform(floatBuffer.toFloatArray(), sampleRate)
+            offlineRecognizer?.decode(stream)
+
+            val rawText = offlineRecognizer?.getResult(stream)?.text?.trim()?.lowercase() ?: ""
+            stream.release()
+
+            val text = rawText.replace(Regex("[.,!?]"), "").trim()
+            val phantomHallucinations = listOf(
+                "thank you", "you", "subscribe", "thanks for watching",
+                "ammen", "okay", "yeah", "bye", "to be continued"
+            )
+
+            if (text.isNotBlank() && !phantomHallucinations.contains(text)) {
+                isProcessingCommand = true
+                thread { routeCognitivePayload(text) }
+            } else {
+                // Abort Sequence
+                soundPool.play(abortSoundId, 1f, 1f, 0, 0, 1f)
+            }
+        }
+    }
+
+    // --- STAGE 3: DETERMINISTIC VOICE CLI ROUTER ---
+
+    private fun routeCognitivePayload(cleanCommand: String) {
+        Log.d("Cipher", "Routing CLI Command: \"$cleanCommand\"")
+
+        // TIER 1: EXACT DETERMINISTIC MATCHING
+        when {
+            cleanCommand.contains("flashlight on") || cleanCommand.contains("torch on") -> {
+                executePrivilegedHardwareAction("[EXEC:FLASHLIGHT_ON]")
+                triggerHapticPulse(true)
+                resetSystemLock()
+                return
+            }
+            cleanCommand.contains("flashlight off") || cleanCommand.contains("torch off") -> {
+                executePrivilegedHardwareAction("[EXEC:FLASHLIGHT_OFF]")
+                triggerHapticPulse(true)
+                resetSystemLock()
+                return
+            }
+            // Add Future Bash/Python Termux script triggers here
+        }
+
+        // --- FALLBACK: LLM QUERY ---
+        queryLocalNeuralCore(cleanCommand)
+    }
+
+    private fun queryLocalNeuralCore(cleanCommand: String) {
         var connection: HttpURLConnection? = null
-        
         try {
             val url = URL("http://127.0.0.1:7000/completion")
             connection = url.openConnection() as HttpURLConnection
@@ -144,306 +237,159 @@ class CipherService : VoiceInteractionService(), RecognitionListener {
             connection.setRequestProperty("Content-Type", "application/json; utf-8")
             connection.doOutput = true
             connection.connectTimeout = 5000
-            connection.readTimeout = 5000
+            connection.readTimeout = 60000
 
-            // Format System Prompt and User intent natively in JSON
-            val systemPrompt = "You are Cipher, an autonomous on-device core. Your operator is Minato. Output ONLY the exact execution tag: [EXEC:FLASHLIGHT_ON], [EXEC:FLASHLIGHT_OFF], [EXEC:HOTSPOT_OFF], or [EXEC:HOTSPOT_ON]. No commentary."
-            
+            val systemPrompt = "Map intent to exact tag: [EXEC:FLASHLIGHT_ON], [EXEC:FLASHLIGHT_OFF], [EXEC:HOTSPOT_ON], [EXEC:HOTSPOT_OFF], or [EXEC:NULL]. Output only the tag."
             val jsonPayload = JSONObject().apply {
-                put("prompt", "$systemPrompt\nUser: $commandText\nCipher:")
-                put("n_predict", 20)
+                put("prompt", "$systemPrompt\nUser: $cleanCommand\nCore:")
+                put("n_predict", 10)
                 put("temperature", 0.0)
             }
 
-            OutputStreamWriter(connection.outputStream, "UTF-8").use { writer ->
-                writer.write(jsonPayload.toString())
-                writer.flush()
+            OutputStreamWriter(connection.outputStream, "UTF-8").use {
+                it.write(jsonPayload.toString())
+                it.flush()
             }
 
             if (connection.responseCode == HttpURLConnection.HTTP_OK) {
                 val responseText = connection.inputStream.bufferedReader().use { it.readText() }
-                val jsonResponse = JSONObject(responseText)
-                val modelOutput = jsonResponse.optString("content", "").trim()
-                
-                Log.d("Cipher", "Local Intelligence Result: $modelOutput")
-                
-                // Fire privileged commands directly or send back to script loop
-                executePrivilegedHardwareAction(modelOutput)
-            } else {
-                Log.e("Cipher", "Server Error Code: ${connection.responseCode}")
-            }
+                val rawOutput = JSONObject(responseText).optString("content", "").trim()
 
+                val finalCommand = when {
+                    rawOutput.contains("[EXEC:FLASHLIGHT_ON]") -> "[EXEC:FLASHLIGHT_ON]"
+                    rawOutput.contains("[EXEC:FLASHLIGHT_OFF]") -> "[EXEC:FLASHLIGHT_OFF]"
+                    else -> "[EXEC:NULL]"
+                }
+
+                if (finalCommand != "[EXEC:NULL]") {
+                    executePrivilegedHardwareAction(finalCommand)
+                    triggerHapticPulse(true)
+                } else {
+                    triggerHapticPulse(false)
+                }
+            }
         } catch (e: Exception) {
-            Log.e("Cipher", "Failed to connect to local llama-server: ${e.message}")
+            triggerHapticPulse(false)
         } finally {
             connection?.disconnect()
-            // Reset back to passive ear mode immediately
-            runOnUiThread { startWatchMode() }
+            resetSystemLock()
         }
     }
 
+    // --- STAGE 4: HARDWARE EXECUTION ---
+
+    @SuppressLint("SdCardPath")
     private fun executePrivilegedHardwareAction(actionTag: String) {
-        // This is where you map your Shizuku/ADB loopback triggers or native Termux broadcasts
-        Log.d("Cipher", "EXCECUTING PRIVILEGED HARDWARE ACTION: $actionTag")
-    }
+        val intent = Intent()
+        intent.setClassName("com.termux", "com.termux.app.RunCommandService")
+        intent.action = "com.termux.RUN_COMMAND"
+        intent.putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/com.termux/files/home")
+        intent.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
 
-    // --- BOILERPLATE OVERRIDES ---
-    override fun onFinalResult(hypothesis: String?) {}
-    override fun onError(exception: Exception?) { Log.e("Cipher", "VOSK Exception: ${exception?.message}") }
-    override fun onTimeout() {}
-    override fun onDestroy() {
-        super.onDestroy()
-        speechService?.stop()
-        speechService?.shutdown()
-        model?.close()
-    }
+        when (actionTag) {
+            "[EXEC:FLASHLIGHT_ON]" -> {
+                intent.putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/termux-torch")
+                intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("on"))
+            }
+            "[EXEC:FLASHLIGHT_OFF]" -> {
+                intent.putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/termux-torch")
+                intent.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("off"))
+            }
+        }
 
-    private fun createForegroundNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Cipher Core")
-            .setContentText("Autonomous Monitoring Active")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID, "Cipher Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(serviceChannel)
+        try {
+            startForegroundService(intent)
+        } catch (e: Exception) {
+            Log.e("Cipher", "Termux Delivery Failed.")
         }
     }
-    
-    private fun runOnUiThread(action: () -> Unit) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post(action)
-    }
-}package com.solo.cipher
 
-import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
-import android.content.Intent
-import android.os.Build
-import android.os.Bundle
-import android.service.voice.VoiceInteractionService
-import android.util.Log
-import androidx.core.app.NotificationCompat
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
-import org.vosk.android.StorageService
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
-import kotlin.concurrent.thread
+    // --- UX HELPERS ---
 
-class CipherService : VoiceInteractionService(), RecognitionListener {
+    private fun triggerHapticPulse(success: Boolean) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
 
-    private val CHANNEL_ID = "CipherServiceChannel"
-    private val SAMPLE_RATE = 16000
-    private var speechService: SpeechService? = null
-    private var model: Model? = null
-    
-    // State control: Is Cipher listening for the wake word, or actively transcribing a command?
-    private var isProcessingCommand = false
-
-    override fun onReady() {
-        super.onReady()
-        Log.d("Cipher", "VoiceInteractionService onReady triggered.")
-        createNotificationChannel()
-        startForeground(1, createForegroundNotification())
-        initVosk()
+        if (success) {
+            vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        } else {
+            // Double pulse for failure
+            vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 40, 50, 40), -1))
+        }
     }
 
-    private fun initVosk() {
-        Log.d("Cipher", "Initializing Local VOSK Model...")
-        StorageService.unpack(this, "model", "model",
-            { loadedModel ->
-                model = loadedModel
-                startWatchMode()
-            },
-            { e -> Log.e("Cipher", "VOSK Unpack Failed: ${e.message}") }
+    private fun showVisualOverlay() {
+        if (blobView != null) return
+
+        blobView = ReactiveBlobView(this)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
         )
+
+        // Locks blob to bottom center of screen
+        params.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        params.y = 100 // Pixel offset from bottom
+
+        windowManager.addView(blobView, params)
     }
 
-    // STATE 1: Continuous passive listening for "Hey Cipher"
-    private fun startWatchMode() {
+    private fun removeVisualOverlay() {
+        blobView?.let {
+            windowManager.removeView(it)
+            blobView = null
+        }
+    }
+
+    private fun resetSystemLock() {
         isProcessingCommand = false
-        try {
-            val recognizer = Recognizer(model, SAMPLE_RATE.toFloat())
-            recognizer.setWords(true)
-            speechService = SpeechService(recognizer, SAMPLE_RATE.toFloat())
-            speechService?.startListening(this)
-            Log.d("Cipher", "Ring 0 (Passive Watch) Active. Awaiting wake word...")
-        } catch (e: Exception) {
-            Log.e("Cipher", "Failed to start passive watch: ${e.message}")
-        }
     }
 
-    // STATE 2: Triggered. Switch VOSK context to ingest the actual user command
-    private fun igniteCommandCapture() {
-        if (isProcessingCommand) return
-        isProcessingCommand = true
-        
-        Log.d("Cipher", "Cipher awakened. Capture mode engaged. Speak now...")
-        speechService?.stop() // Reset listener for a clean stream capture
-        
-        try {
-            val recognizer = Recognizer(model, SAMPLE_RATE.toFloat())
-            speechService = SpeechService(recognizer, SAMPLE_RATE.toFloat())
-            speechService?.startListening(this)
-        } catch (e: Exception) {
-            Log.e("Cipher", "Failed to ignite command capture: ${e.message}")
-            startWatchMode()
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Handle physical hardware triggers (Long-press power button / overlay)
-        if (intent?.getStringExtra("TRIGGER_TYPE") == "MANUAL") {
-            Log.d("Cipher", "Hardware/Manual Trigger Intercepted.")
-            igniteCommandCapture()
-        }
-        return START_STICKY
-    }
-
-    // --- VOSK RECOGNITION DECODER LOOP ---
-
-    override fun onPartialResult(hypothesis: String?) {
-        if (isProcessingCommand) return // Ignore partial matches while processing commands
-        
-        try {
-            val json = JSONObject(hypothesis ?: "{}")
-            val partial = json.optString("partial", "").lowercase()
-            if (partial.contains("cipher")) {
-                igniteCommandCapture()
-            }
-        } catch (e: Exception) {}
-    }
-
-    override fun onResult(hypothesis: String?) {
-        try {
-            val json = JSONObject(hypothesis ?: "{}")
-            val text = json.optString("text", "").trim()
-            if (text.isEmpty()) return
-
-            if (!isProcessingCommand) {
-                // We are in watch mode, verify full word match
-                if (text.contains("cipher")) {
-                    igniteCommandCapture()
-                }
-            } else {
-                // Capture mode active: This text is the actual command payload
-                Log.d("Cipher", "Local STT Complete: \"$text\"")
-                speechService?.stop()
-                
-                // Route text payload to the local Termux neural loop asynchronously
-                thread {
-                    queryLocalNeuralCore(text)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("Cipher", "Result Parsing Error: ${e.message}")
-        }
-    }
-
-    // --- LOCAL TERMINAL LINK (TERMUX HTTP COMPONENT) ---
-    private fun queryLocalNeuralCore(commandText: String) {
-        Log.d("Cipher", "Routing payload to local Llama-Server (Port 7000)...")
-        var connection: HttpURLConnection? = null
-        
-        try {
-            val url = URL("http://127.0.0.1:7000/completion")
-            connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "POST"
-            connection.setRequestProperty("Content-Type", "application/json; utf-8")
-            connection.doOutput = true
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
-
-            // Format System Prompt and User intent natively in JSON
-            val systemPrompt = "You are Cipher, an autonomous on-device core. Your operator is Minato. Output ONLY the exact execution tag: [EXEC:FLASHLIGHT_ON], [EXEC:FLASHLIGHT_OFF], [EXEC:HOTSPOT_OFF], or [EXEC:HOTSPOT_ON]. No commentary."
-            
-            val jsonPayload = JSONObject().apply {
-                put("prompt", "$systemPrompt\nUser: $commandText\nCipher:")
-                put("n_predict", 20)
-                put("temperature", 0.0)
-            }
-
-            OutputStreamWriter(connection.outputStream, "UTF-8").use { writer ->
-                writer.write(jsonPayload.toString())
-                writer.flush()
-            }
-
-            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
-                val jsonResponse = JSONObject(responseText)
-                val modelOutput = jsonResponse.optString("content", "").trim()
-                
-                Log.d("Cipher", "Local Intelligence Result: $modelOutput")
-                
-                // Fire privileged commands directly or send back to script loop
-                executePrivilegedHardwareAction(modelOutput)
-            } else {
-                Log.e("Cipher", "Server Error Code: ${connection.responseCode}")
-            }
-
-        } catch (e: Exception) {
-            Log.e("Cipher", "Failed to connect to local llama-server: ${e.message}")
-        } finally {
-            connection?.disconnect()
-            // Reset back to passive ear mode immediately
-            runOnUiThread { startWatchMode() }
-        }
-    }
-
-    private fun executePrivilegedHardwareAction(actionTag: String) {
-        // This is where you map your Shizuku/ADB loopback triggers or native Termux broadcasts
-        Log.d("Cipher", "EXCECUTING PRIVILEGED HARDWARE ACTION: $actionTag")
-    }
-
-    // --- BOILERPLATE OVERRIDES ---
-    override fun onFinalResult(hypothesis: String?) {}
-    override fun onError(exception: Exception?) { Log.e("Cipher", "VOSK Exception: ${exception?.message}") }
-    override fun onTimeout() {}
-    override fun onDestroy() {
-        super.onDestroy()
-        speechService?.stop()
-        speechService?.shutdown()
-        model?.close()
-    }
-
-    private fun createForegroundNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Cipher Core")
-            .setContentText("Autonomous Monitoring Active")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
+    private fun runOnUiThread(action: () -> Unit) {
+        Handler(Looper.getMainLooper()).post(action)
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID, "Cipher Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(serviceChannel)
-        }
+        val serviceChannel = NotificationChannel(channelId, "Cipher Core", NotificationManager.IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java)?.createNotificationChannel(serviceChannel)
     }
-    
-    private fun runOnUiThread(action: () -> Unit) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post(action)
+
+    // --- CUSTOM REACTIVE VIEW ---
+    private inner class ReactiveBlobView(context: Context) : View(context) {
+        private val paint = Paint().apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+
+        private var currentRadius = 30f
+        private val baseRadius = 30f
+        private val maxRadius = 150f
+
+        fun updateRms(rms: Float) {
+            // Scale RMS (usually 0.0 - 0.1) to visually noticeable expansion
+            val targetRadius = baseRadius + (rms * 1500f)
+            currentRadius = min(targetRadius, maxRadius)
+            invalidate() // Forces redraw
+        }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            setMeasuredDimension((maxRadius * 2).toInt(), (maxRadius * 2).toInt())
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.drawCircle(width / 2f, height / 2f, currentRadius, paint)
+        }
     }
 }
